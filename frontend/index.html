@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Omniscience - 资产语义拓扑工作台</title>
+
+    <script src="https://unpkg.com/three@0.136.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/globe.gl@2.32.1/dist/globe.gl.min.js"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+    <div id="app" class="app-shell">
+        <aside class="left-rail">
+            <button class="brand" @click="resetWorkspace" title="返回态势总览">
+                <span class="brand-mark"><i class="fa-solid fa-eye"></i></span>
+                <span>
+                    <strong>OMNISCIENCE</strong>
+                    <small>资产语义拓扑</small>
+                </span>
+            </button>
+
+            <form class="search-panel" @submit.prevent="runSearch">
+                <label>搜索资产</label>
+                <div class="search-box">
+                    <input v-model="searchText" type="text" placeholder="域名 / IP / 标签关键词">
+                    <button type="submit" title="搜索"><i class="fa-solid fa-magnifying-glass"></i></button>
+                </div>
+                <div class="search-status" v-if="isProbing">
+                    <i class="fa-solid fa-satellite-dish fa-beat-fade"></i>
+                    正在实时探测并打标
+                </div>
+                <div class="search-status error" v-if="loadError">
+                    <i class="fa-solid fa-triangle-exclamation"></i>
+                    {{ loadError }}
+                </div>
+            </form>
+
+            <section class="metric-grid">
+                <article>
+                    <span>{{ metricLabels.nodes }}</span>
+                    <strong>{{ metricStats.total_nodes }}</strong>
+                </article>
+                <article>
+                    <span>{{ metricLabels.edges }}</span>
+                    <strong>{{ metricStats.total_edges }}</strong>
+                </article>
+                <article>
+                    <span>{{ metricLabels.risk }}</span>
+                    <strong>{{ metricStats.risk_nodes }}</strong>
+                </article>
+                <article>
+                    <span>{{ metricLabels.infra }}</span>
+                    <strong>{{ metricStats.infra_nodes }}</strong>
+                </article>
+            </section>
+
+            <section class="panel">
+                <div class="panel-title">
+                    <span>标签筛选</span>
+                    <button @click="clearTagFilter" title="清除筛选"><i class="fa-solid fa-rotate-left"></i></button>
+                </div>
+                <div class="tag-cloud">
+                    <button
+                        v-for="tag in topTags"
+                        :key="tag.name"
+                        :class="['tag-chip', tagClass(tag.name), { active: selectedTag === tag.name }]"
+                        @click="toggleTag(tag.name)">
+                        <span>{{ tag.name }}</span>
+                        <b>{{ tag.count }}</b>
+                    </button>
+                </div>
+            </section>
+
+            <section class="panel compact">
+                <div class="panel-title">
+                    <span>图层</span>
+                </div>
+                <label v-for="item in edgeOptions" :key="item.key" class="switch-row">
+                    <input type="checkbox" v-model="edgeFilters[item.key]" @change="refreshLayers">
+                    <span :class="['edge-swatch', item.key]"></span>
+                    <em>{{ item.label }}</em>
+                </label>
+            </section>
+        </aside>
+
+        <main class="main-stage">
+            <header class="topbar">
+                <div>
+                    <p>{{ modeLabel }}</p>
+                    <h1>{{ pageTitle }}</h1>
+                </div>
+                <div class="top-actions">
+                    <button @click="toggleMapMode" :title="mapMode === 'globe' ? '切换 2D 地图' : '切换 3D 地球'">
+                        <i :class="['fa-solid', mapMode === 'globe' ? 'fa-map' : 'fa-earth-americas']"></i>
+                    </button>
+                    <button @click="fitMap" title="适配视野"><i class="fa-solid fa-compress"></i></button>
+                    <button @click="reloadOverview" title="刷新概览"><i class="fa-solid fa-arrows-rotate"></i></button>
+                </div>
+            </header>
+
+            <section class="map-wrap">
+                <div id="globe-container" :class="{ active: mapMode === 'globe' }"></div>
+                <div id="leaflet-container" :class="{ active: mapMode === 'map' }"></div>
+
+                <div class="map-loading" v-if="isLoading">
+                    <i class="fa-solid fa-circle-notch fa-spin"></i>
+                    <span>正在加载资产拓扑</span>
+                </div>
+
+                <div class="overview-strip">
+                    <div>
+                        <span>主导标签</span>
+                        <strong>{{ leadingTag || '暂无' }}</strong>
+                    </div>
+                    <div>
+                        <span>命中节点</span>
+                        <strong>{{ selectedNode ? selectedNode.domain : '未选择' }}</strong>
+                    </div>
+                    <div>
+                        <span>数据模式</span>
+                        <strong>{{ isSearchMode ? '局部关系' : '100 节点概览' }}</strong>
+                    </div>
+                    <div>
+                        <span>地图模式</span>
+                        <strong>{{ mapMode === 'globe' ? '3D 地球' : '2D 地图' }}</strong>
+                    </div>
+                </div>
+            </section>
+
+            <section class="bottom-dock">
+                <article class="dock-card">
+                    <div class="dock-title">语义标签分布</div>
+                    <div class="bar-list">
+                        <div v-for="tag in topTags.slice(0, 7)" :key="tag.name" class="bar-row">
+                            <span>{{ tag.name }}</span>
+                            <div><i :style="{ width: tagPercent(tag.count) + '%' }"></i></div>
+                            <b>{{ tag.count }}</b>
+                        </div>
+                    </div>
+                </article>
+                <article class="dock-card">
+                    <div class="dock-title">最近资产</div>
+                    <button
+                        v-for="node in visibleNodes.slice(0, 6)"
+                        :key="node.id"
+                        class="asset-row"
+                        @click="selectNode(node, true)">
+                        <span>
+                            <strong>{{ node.domain }}</strong>
+                            <small>{{ node.ip || 'Unknown IP' }}</small>
+                        </span>
+                        <em :class="tagClass(primaryTag(node))">{{ primaryTag(node) }}</em>
+                    </button>
+                </article>
+            </section>
+        </main>
+
+        <aside class="detail-drawer" :class="{ open: selectedNode }">
+            <button class="drawer-close" @click="selectedNode = null" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+            <template v-if="selectedNode">
+                <div class="drawer-head">
+                    <span :class="['risk-dot', nodeTone(selectedNode)]"></span>
+                    <div>
+                        <h2>{{ selectedNode.domain }}</h2>
+                        <p>{{ selectedNode.ip }} · {{ selectedNode.loc || 'Unknown' }}</p>
+                    </div>
+                </div>
+
+                <div class="drawer-tags">
+                    <span v-for="tag in selectedNode.tags" :key="tag.name" :class="['tag-chip', tagClass(tag.name)]">
+                        {{ tag.name }}
+                    </span>
+                </div>
+
+                <div class="drawer-actions">
+                    <button @click="openDetailPanel(selectedNode)">
+                        <i class="fa-solid fa-table-list"></i>
+                        <span>查看详细信息</span>
+                    </button>
+                    <button @click="openStarMap(selectedNode)">
+                        <i class="fa-solid fa-diagram-project"></i>
+                        <span>生态关联星图</span>
+                    </button>
+                </div>
+
+                <section class="detail-section">
+                    <h3>模型语义</h3>
+                    <div class="confidence-list" v-if="modelConfidences(selectedNode).length">
+                        <div v-for="item in modelConfidences(selectedNode)" :key="item.name">
+                            <span>{{ item.name }}</span>
+                            <div><i :style="{ width: (item.value * 100).toFixed(1) + '%' }"></i></div>
+                            <b>{{ (item.value * 100).toFixed(1) }}%</b>
+                        </div>
+                    </div>
+                    <p v-else class="muted">暂无置信度明细，可能来自旧数据或规则标签。</p>
+                </section>
+
+                <section class="detail-section">
+                    <h3>Web 指纹</h3>
+                    <dl class="kv-list">
+                        <div><dt>Title</dt><dd>{{ detailValue('title') }}</dd></div>
+                        <div><dt>Server</dt><dd>{{ detailValue('server') }}</dd></div>
+                        <div><dt>WAF</dt><dd>{{ detailValue('waf') }}</dd></div>
+                        <div><dt>HTTP</dt><dd>{{ detailValue('http_status') }}</dd></div>
+                    </dl>
+                </section>
+
+                <section class="detail-section">
+                    <h3>基础设施</h3>
+                    <dl class="kv-list">
+                        <div><dt>端口</dt><dd>{{ detailValue('open_ports') }}</dd></div>
+                        <div><dt>SSL</dt><dd>{{ detailValue('ssl_issuer') }}</dd></div>
+                        <div><dt>DNS NS</dt><dd>{{ detailValue('dns_ns') }}</dd></div>
+                        <div><dt>坐标来源</dt><dd>{{ detailValue('coordinate_source') }}</dd></div>
+                    </dl>
+                </section>
+            </template>
+        </aside>
+
+        <section class="asset-detail-page" v-if="detailPanelOpen && detailTarget">
+            <div class="asset-detail-inner">
+                <header class="asset-detail-header">
+                    <button class="icon-button ghost" @click="closeDetailPanel" title="返回"><i class="fa-solid fa-arrow-left"></i></button>
+                    <div class="asset-favicon">
+                        <img :src="faviconUrl(detailTarget)" @error="handleFaviconError" alt="">
+                        <i class="fa-solid fa-globe"></i>
+                    </div>
+                    <div class="asset-title-block">
+                        <h2>{{ detailTarget.domain }}</h2>
+                        <div class="drawer-tags">
+                            <span v-for="tag in detailTarget.tags" :key="tag.name" :class="['tag-chip', tagClass(tag.name)]">{{ tag.name }}</span>
+                        </div>
+                    </div>
+                    <button class="primary-action" @click="openStarMap(detailTarget)">
+                        <i class="fa-solid fa-diagram-project"></i>
+                        <span>展开生态关联星图</span>
+                    </button>
+                </header>
+
+                <div class="detail-layout">
+                    <div class="detail-column">
+                        <section class="detail-card tall">
+                            <h3><i class="fa-solid fa-globe"></i>基础设施</h3>
+                            <dl class="detail-pairs large">
+                                <div><dt>主要 IP</dt><dd>{{ detailTarget.ip || 'Unknown' }}</dd></div>
+                                <div><dt>地理位置</dt><dd>{{ detailTarget.loc || 'Unknown' }}</dd></div>
+                                <div><dt>ASN</dt><dd>{{ detailTarget.asn || nodeDetailValue(detailTarget, 'asn') }}</dd></div>
+                            </dl>
+                            <div class="coordinate-box">
+                                <span>{{ coordinateText(detailTarget) }}</span>
+                            </div>
+                        </section>
+
+                        <section class="detail-card">
+                            <h3><i class="fa-solid fa-network-wired"></i>开放端口服务</h3>
+                            <div class="port-list">
+                                <div v-for="port in splitList(nodeDetailValue(detailTarget, 'open_ports'))" :key="port">
+                                    <strong>{{ port }}</strong>
+                                    <span>open</span>
+                                </div>
+                                <p v-if="!splitList(nodeDetailValue(detailTarget, 'open_ports')).length" class="muted">暂无开放端口记录</p>
+                            </div>
+                        </section>
+
+                        <section class="detail-card">
+                            <h3><i class="fa-solid fa-lock"></i>SSL/TLS 证书</h3>
+                            <dl class="detail-pairs">
+                                <div><dt>颁发者</dt><dd>{{ nodeDetailValue(detailTarget, 'ssl_issuer') }}</dd></div>
+                                <div><dt>有效期至</dt><dd>{{ nodeDetailValue(detailTarget, 'ssl_valid_to') }}</dd></div>
+                            </dl>
+                        </section>
+                    </div>
+
+                    <div class="detail-column wide">
+                        <section class="detail-card">
+                            <h3><i class="fa-solid fa-fingerprint"></i>应用层指纹墙</h3>
+                            <div class="fingerprint-grid">
+                                <div><i class="fa-solid fa-server"></i><strong>{{ nodeDetailValue(detailTarget, 'server') }}</strong><span>Web 服务器</span></div>
+                                <div><i class="fa-solid fa-earth-asia"></i><strong>{{ nodeDetailValue(detailTarget, 'http_status') }}</strong><span>HTTP 状态</span></div>
+                                <div><i class="fa-solid fa-shield-halved"></i><strong>{{ nodeDetailValue(detailTarget, 'waf') }}</strong><span>WAF</span></div>
+                            </div>
+                        </section>
+
+                        <div class="detail-grid-two">
+                            <section class="detail-card">
+                                <h3><i class="fa-solid fa-sitemap"></i>DNS 记录</h3>
+                                <dl class="detail-pairs">
+                                    <div><dt>NS</dt><dd>{{ nodeDetailValue(detailTarget, 'dns_ns') }}</dd></div>
+                                    <div><dt>MX</dt><dd>{{ nodeDetailValue(detailTarget, 'dns_mx') }}</dd></div>
+                                    <div><dt>CNAME</dt><dd>{{ nodeDetailValue(detailTarget, 'dns_cname') }}</dd></div>
+                                </dl>
+                            </section>
+                            <section class="detail-card">
+                                <h3><i class="fa-solid fa-certificate"></i>证书详情</h3>
+                                <dl class="detail-pairs">
+                                    <div><dt>主题</dt><dd>{{ nodeDetailValue(detailTarget, 'ssl_subject') }}</dd></div>
+                                    <div><dt>签发</dt><dd>{{ nodeDetailValue(detailTarget, 'ssl_valid_from') }}</dd></div>
+                                    <div><dt>过期</dt><dd>{{ nodeDetailValue(detailTarget, 'ssl_valid_to') }}</dd></div>
+                                </dl>
+                            </section>
+                        </div>
+
+                        <section class="detail-card">
+                            <h3><i class="fa-solid fa-brain"></i>模型语义</h3>
+                            <div class="confidence-list detail-confidence" v-if="modelConfidences(detailTarget).length">
+                                <div v-for="item in modelConfidences(detailTarget)" :key="item.name">
+                                    <span>{{ item.name }}</span>
+                                    <div><i :style="{ width: (item.value * 100).toFixed(1) + '%' }"></i></div>
+                                    <b>{{ (item.value * 100).toFixed(1) }}%</b>
+                                </div>
+                            </div>
+                            <p v-else class="muted">暂无模型置信度明细</p>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="starmap-overlay" v-show="starMapOpen">
+            <div class="starmap-brand"><i class="fa-solid fa-eye"></i><span>OMNISCIENCE</span></div>
+            <div id="network-container"></div>
+            <aside class="starmap-filter">
+                <h3><i class="fa-solid fa-filter"></i>图谱过滤器</h3>
+                <label v-for="item in edgeOptions" :key="item.key" class="switch-row">
+                    <input type="checkbox" v-model="edgeFilters[item.key]" @change="updateStarMapFilters">
+                    <span :class="['edge-swatch', item.key]"></span>
+                    <em>{{ item.label }}</em>
+                </label>
+                <button @click="resetStarMapView"><i class="fa-solid fa-crosshairs"></i>重置视角</button>
+            </aside>
+            <aside class="starmap-node-card" :class="{ open: graphSelection }">
+                <template v-if="graphSelection">
+                    <button class="drawer-close" @click="graphSelection = null" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+                    <h3>{{ graphSelection.label }}</h3>
+                    <p>{{ graphSelection.group === 'center' ? '当前目标' : graphSelection.group === 'relation' ? '关系聚合节点' : '关联资产' }}</p>
+                    <button v-if="graphSelection.asset" @click="openDetailPanel(graphSelection.asset)">
+                        <i class="fa-solid fa-table-list"></i>查看详细信息
+                    </button>
+                </template>
+            </aside>
+            <button class="starmap-close" @click="closeStarMap" title="关闭星图"><i class="fa-solid fa-xmark"></i></button>
+        </section>
+    </div>
+
+    <script src="./app.js"></script>
+</body>
+</html>
